@@ -1,0 +1,301 @@
+from __future__ import annotations
+
+import copy
+import json
+import socket
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+
+class VenusError(RuntimeError): pass
+class VenusCommunicationError(VenusError): pass
+class VenusProtocolError(VenusError): pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class VenusClient:
+    """Serialized Marstek Open API client. The API exposes request/response UDP, no local push channel."""
+    def __init__(self, config: dict[str, Any], socket_factory: Callable[..., Any] = socket.socket):
+        self.config = config
+        self._socket_factory = socket_factory
+        self._lock = threading.Lock()
+        self._id = 100
+
+    def request(self, method: str, params: Any = None) -> dict[str, Any]:
+        """Send one serialized UDP request and wait only for its matching response.
+
+        Late replies for older request ids are ignored instead of poisoning the
+        current request. A retry keeps the same request id/payload.
+        """
+        with self._lock:
+            self._id += 1
+            request_id = self._id
+            envelope = {"id": request_id, "method": method}
+            envelope["params"] = {"id": self.config["deviceId"]} if params is None else params
+            payload = json.dumps(envelope, separators=(",", ":")).encode()
+            expected = (self.config["ipAddress"], int(self.config["udpPort"]))
+            timeout = float(self.config["timeoutSeconds"])
+            last: Exception | None = None
+
+            for attempt in range(int(self.config["retries"])):
+                sock = None
+                try:
+                    sock = self._socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind(("0.0.0.0", int(self.config["udpPort"])))
+                    sock.sendto(payload, expected)
+
+                    deadline = time.monotonic() + timeout
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(f"Timed out waiting for request id {request_id}")
+                        sock.settimeout(remaining)
+                        raw, sender = sock.recvfrom(65535)
+                        if sender != expected:
+                            continue
+                        try:
+                            response = json.loads(raw.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        if not isinstance(response, dict):
+                            continue
+                        if response.get("id") != request_id:
+                            continue
+                        if "error" in response:
+                            raise VenusProtocolError(f"Marstek API error: {response['error']}")
+                        if "result" not in response:
+                            raise VenusProtocolError("Response has no result")
+                        return response["result"]
+                except VenusProtocolError:
+                    raise
+                except (OSError, TimeoutError) as exc:
+                    last = exc
+                    if attempt + 1 < int(self.config["retries"]):
+                        time.sleep(float(self.config["retryDelaySeconds"]))
+                finally:
+                    if sock is not None:
+                        sock.close()
+
+            raise VenusCommunicationError(
+                f"No valid response after {self.config['retries']} attempts: {last}"
+            )
+
+    def get_device(self): return self.request("Marstek.GetDevice", {"ble_mac": "0"})
+    def get_status(self): return self.request("ES.GetStatus")
+    def get_mode(self): return self.request("ES.GetMode")
+    def get_battery(self): return self.request("Bat.GetStatus")
+    def set_passive(self, power: int, cd_time: int):
+        return self.request("ES.SetMode", {"id": self.config["deviceId"], "config": {"mode": "Passive", "passive_cfg": {"power": power, "cd_time": cd_time}}})
+
+
+class MarstekService:
+    def __init__(self, client: VenusClient, config: dict[str, Any], start_polling: bool = True, history=None):
+        self.client, self.config = client, config
+        self.history = history
+        self._state_lock, self._poll_lock, self._operation_lock = threading.Lock(), threading.Lock(), threading.RLock()
+        self._stop = threading.Event()
+        self._state = {"online": False, "stale": True, "lastSuccessfulPoll": None, "lastPollAttempt": None,
+                       "lastError": None, "consecutiveFailures": 0, "mode": None, "soc": None,
+                       "batteryTemperature": None, "batteryCapacity": None, "ratedCapacity": None,
+                       "ongridPower": None, "offgridPower": None, "chargFlag": None, "dischrgFlag": None,
+                       "totalGridInputEnergy": None, "totalGridOutputEnergy": None, "model": None, "deviceApiVersion": None,
+                       "write": {"requestedPower": None, "acknowledged": False, "verified": False, "verifiedPower": None,
+                                 "verificationTimestamp": None, "verificationError": None}}
+        self._last_success_monotonic: float | None = None
+        self._last_battery_poll = 0.0
+        self._device_loaded = False
+        self._diagnostic_lock = threading.Lock()
+        self._previous_write_power: int | None = None
+        self._previous_write_monotonic: float | None = None
+        if start_polling:
+            self._thread = threading.Thread(target=self._poll_loop, name="marstek-poller", daemon=True); self._thread.start()
+
+    def _write_power_diagnostic(self, payload: dict[str, Any]):
+        if not bool(self.config.get("powerControlDiagnostics", False)):
+            return
+        try:
+            now = datetime.now().astimezone()
+            record = {"timestampUtc": datetime.now(timezone.utc).isoformat(),
+                      "timestampLocal": now.isoformat(), **payload}
+            configured_path = self.config.get("powerControlDiagnosticsPath")
+            if not configured_path:
+                return
+            path = Path(configured_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            with self._diagnostic_lock:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+        except Exception:
+            # Diagnostics must never affect device control or polling.
+            pass
+
+    def _set(self, **values):
+        with self._state_lock: self._state.update(values)
+
+    def snapshot(self):
+        with self._state_lock:
+            result = copy.deepcopy(self._state)
+        result["stale"] = self._last_success_monotonic is None or time.monotonic() - self._last_success_monotonic > float(self.config["staleThresholdSeconds"])
+        return result
+
+    def poll_once(self) -> bool:
+        if not self._poll_lock.acquire(blocking=False): return False
+        try:
+            with self._operation_lock:
+                self._set(lastPollAttempt=utc_now())
+                status, mode = self.client.get_status(), self.client.get_mode()
+                battery, device = None, None
+                if not self._device_loaded:
+                    device = self.client.get_device(); self._device_loaded = True
+                if time.monotonic() - self._last_battery_poll >= float(self.config["batteryPollIntervalSeconds"]):
+                    battery = self.client.get_battery(); self._last_battery_poll = time.monotonic()
+            previous = self.snapshot()
+            values = {"online": True, "stale": False, "lastSuccessfulPoll": utc_now(), "lastError": None, "consecutiveFailures": 0,
+                      "mode": mode.get("mode", mode), "soc": status.get("bat_soc"),
+                      "batteryTemperature": previous["batteryTemperature"], "batteryCapacity": previous["batteryCapacity"],
+                      "ratedCapacity": previous["ratedCapacity"], "chargFlag": previous["chargFlag"],
+                      "dischrgFlag": previous["dischrgFlag"],
+                      "ongridPower": status.get("ongrid_power"), "offgridPower": status.get("offgrid_power"),
+                      "totalGridInputEnergy": status.get("total_grid_input_energy"), "totalGridOutputEnergy": status.get("total_grid_output_energy")}
+            if battery is not None:
+                values.update(soc=battery.get("soc", values["soc"]), chargFlag=battery.get("charg_flag"),
+                              dischrgFlag=battery.get("dischrg_flag"), batteryTemperature=battery.get("bat_temp"),
+                              batteryCapacity=battery.get("bat_capacity"), ratedCapacity=battery.get("rated_capacity"))
+            if device:
+                values.update(model=device.get("model", device.get("device")), deviceApiVersion=device.get("ver", device.get("version", device.get("api_version"))))
+            self._last_success_monotonic = time.monotonic(); self._set(**values)
+            if self.history is not None:
+                self.history.record(self.snapshot(), values["lastSuccessfulPoll"])
+            return True
+        except VenusError as exc:
+            with self._state_lock:
+                failures = self._state["consecutiveFailures"] + 1
+                self._state.update(lastError=str(exc), consecutiveFailures=failures, online=failures < int(self.config["unhealthyFailureThreshold"]))
+            return False
+        finally: self._poll_lock.release()
+
+    def _poll_loop(self):
+        while not self._stop.wait(float(self.config["statusPollIntervalSeconds"])): self.poll_once()
+
+    def health(self):
+        s = self.snapshot()
+        if not s["online"]: level, code = "unhealthy", 503
+        elif s["stale"] or s["consecutiveFailures"] or (s["write"]["acknowledged"] and not s["write"]["verified"]): level, code = "degraded", 200
+        else: level, code = "healthy", 200
+        result = {"ok": level == "healthy", "status": level, "online": s["online"], "stale": s["stale"], "consecutiveFailures": s["consecutiveFailures"], "lastError": s["lastError"]}
+        if self.history is not None:
+            result["persistence"] = self.history.health()
+            if not result["persistence"]["databaseReachable"] or result["persistence"]["persistenceError"]:
+                result["ok"], result["status"] = False, "degraded"
+        return result, code
+
+    def get_status(self):
+        with self._operation_lock:
+            return self.client.get_status()
+
+    def get_mode(self):
+        with self._operation_lock:
+            return self.client.get_mode()
+
+    def get_battery(self):
+        with self._operation_lock:
+            return self.client.get_battery()
+
+    def set_power(self, power: int, cd_time: int | None = None, diagnostic_metadata: dict[str, Any] | None = None):
+        with self._operation_lock:
+            state = self.snapshot()
+            if power:
+                if not state["online"] or state["stale"] or state["consecutiveFailures"] >= int(self.config["unhealthyFailureThreshold"]): raise VenusError("Non-zero write blocked: communication state is unsafe")
+                if state["soc"] is None or state["chargFlag"] is None or state["dischrgFlag"] is None: raise VenusError("Non-zero write blocked: battery state is unknown")
+                if power < 0 and not state["chargFlag"]: raise VenusError("Charging is not allowed")
+                if power > 0 and not state["dischrgFlag"]: raise VenusError("Discharging is not allowed")
+            limit = int(self.config["maxDischargePowerWatts"] if power >= 0 else self.config["maxChargePowerWatts"])
+            if abs(power) > limit: raise VenusError("Requested power exceeds configured limit")
+            duration = int(cd_time or self.config.get("defaultCommandCdTimeSeconds", 960))
+            if duration <= 0: raise VenusError("cd_time must be positive")
+            maximum_duration = int(self.config.get("maximumCommandCdTimeSeconds", 960))
+            if power and duration > maximum_duration:
+                raise VenusError(f"Non-zero cd_time exceeds configured maximum of {maximum_duration} seconds")
+            write = {"requestedPower": power, "acknowledged": False, "verified": False, "verifiedPower": None, "verificationTimestamp": None, "verificationError": None}
+            command_id = str(uuid.uuid4())
+            write_started = time.monotonic()
+            seconds_since_previous = None if self._previous_write_monotonic is None else write_started - self._previous_write_monotonic
+            metadata = diagnostic_metadata if isinstance(diagnostic_metadata, dict) else {}
+            common = {"commandId": command_id, "requestedPowerWatts": power,
+                      "plannerReason": metadata.get("plannerReason"),
+                      "siteNetWithoutBatteryWatts": metadata.get("siteNetWithoutBatteryWatts"),
+                      "solarSurplusWatts": metadata.get("solarSurplusWatts"),
+                      "plannerRecommendedPowerWatts": metadata.get("plannerRecommendedPowerWatts"),
+                      "plannerAction": metadata.get("plannerAction")}
+            self._write_power_diagnostic({"event": "power_write_start", **common,
+                                          "previousRequestedPowerWatts": self._previous_write_power,
+                                          "secondsSincePreviousWrite": seconds_since_previous,
+                                          "actualPowerBeforeWatts": state.get("ongridPower"),
+                                          "durationSeconds": duration})
+            self._previous_write_power = power
+            self._previous_write_monotonic = write_started
+            verification_started = None
+            verification_attempts = 0
+            try:
+                ack = self.client.set_passive(power, duration); write["acknowledged"] = ack.get("set_result") is True
+            except VenusCommunicationError as exc:
+                write["verificationError"] = f"Write response unavailable: {exc}"
+            mode = None
+            verification_started = time.monotonic()
+            if write["acknowledged"] or write["verificationError"]:
+                # Venus can need several seconds before a new passive setpoint is
+                # visible in GetStatus. Poll for the requested value instead of
+                # declaring a valid write failed after one early read-back.
+                timeout = float(self.config.get("writeVerificationTimeoutSeconds", 10))
+                poll_seconds = float(self.config.get("writeVerificationPollSeconds", 1))
+                tolerance = int(self.config["writeVerificationToleranceWatts"])
+                deadline = time.monotonic() + timeout
+                last_error = None
+                while True:
+                    try:
+                        verification_attempts += 1
+                        status = self.client.get_status(); mode_result = self.client.get_mode()
+                        actual = status.get("ongrid_power"); mode = mode_result.get("mode", mode_result); write["verifiedPower"] = actual
+                        power_matches = actual is not None and abs(actual - power) <= tolerance
+                        write["verified"] = mode == "Passive" and power_matches
+                        self._set(online=True, lastError=None, consecutiveFailures=0, ongridPower=actual, mode=mode,
+                                  soc=status.get("bat_soc", self.snapshot().get("soc")))
+                        self._last_success_monotonic = time.monotonic()
+                        last_error = None
+                        if write["verified"]:
+                            write["verificationError"] = None
+                            break
+                    except VenusError as exc:
+                        last_error = exc
+                    if time.monotonic() >= deadline:
+                        if last_error is not None:
+                            write["verificationError"] = f"Verification read-back failed: {last_error}"
+                        else:
+                            write["verificationError"] = f"Read-back {write['verifiedPower']} W does not confirm requested {power} W"
+                        break
+                    time.sleep(poll_seconds)
+            write["verificationTimestamp"] = utc_now(); self._set(write=write)
+            result = copy.deepcopy(write)
+            result.update(actualPower=write["verifiedPower"], mode=mode, soc=self.snapshot().get("soc"))
+            verification_ms = None if verification_started is None else round((time.monotonic() - verification_started) * 1000, 3)
+            self._write_power_diagnostic({"event": "power_write_result", **common,
+                                          "actualPowerAfterWatts": write["verifiedPower"],
+                                          "verificationDurationMs": verification_ms,
+                                          "targetReached": bool(write["verified"]),
+                                          "acknowledged": bool(write["acknowledged"]),
+                                          "resultStatus": "verified" if write["verified"] else "not_verified",
+                                          "verificationError": write["verificationError"],
+                                          "verificationAttempts": verification_attempts})
+            return result
+
+    def stop(self, cd_time: int | None = None, diagnostic_metadata: dict[str, Any] | None = None):
+        return self.set_power(0, cd_time, diagnostic_metadata)
