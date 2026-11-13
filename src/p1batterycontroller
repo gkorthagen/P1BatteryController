@@ -1,6 +1,15 @@
 from __future__ import annotations
+import sys as _logging_sys
+from pathlib import Path as _LoggingPath
+_logging_sys.path.insert(0, str(_LoggingPath(__file__).resolve().parents[2] / "LogModule"))
+from streamplatform_logging import StreamPlatformDailyHandler, enqueue_daily_log as append_daily_log, daily_log_path
+
+import logging
+
+logger = logging.getLogger("marstek.poller")
 
 import copy
+import queue
 import json
 import socket
 import threading
@@ -27,6 +36,20 @@ class VenusClient:
         self._socket_factory = socket_factory
         self._lock = threading.Lock()
         self._id = 100
+        self._communication_observer = None
+
+    def set_communication_observer(self, observer):
+        self._communication_observer = observer
+
+    def _notify_communication(self, method: str):
+        observer = self._communication_observer
+        if observer is None:
+            return
+        try:
+            observer(method)
+        except Exception:
+            # Observability must never break device communication.
+            pass
 
     def request(self, method: str, params: Any = None) -> dict[str, Any]:
         """Send one serialized UDP request and wait only for its matching response.
@@ -73,6 +96,7 @@ class VenusClient:
                             raise VenusProtocolError(f"Marstek API error: {response['error']}")
                         if "result" not in response:
                             raise VenusProtocolError("Response has no result")
+                        self._notify_communication(method)
                         return response["result"]
                 except VenusProtocolError:
                     raise
@@ -102,7 +126,9 @@ class MarstekService:
         self.history = history
         self._state_lock, self._poll_lock, self._operation_lock = threading.Lock(), threading.Lock(), threading.RLock()
         self._stop = threading.Event()
-        self._state = {"online": False, "stale": True, "lastSuccessfulPoll": None, "lastPollAttempt": None,
+        self._state = {"online": False, "stale": True, "communicationStale": True,
+                       "lastCommunicationAt": None, "lastSuccessfulReadAt": None, "lastSuccessfulWriteAt": None,
+                       "lastSuccessfulPoll": None, "lastPollAttempt": None,
                        "lastError": None, "consecutiveFailures": 0, "mode": None, "soc": None,
                        "batteryTemperature": None, "batteryCapacity": None, "ratedCapacity": None,
                        "ongridPower": None, "offgridPower": None, "chargFlag": None, "dischrgFlag": None,
@@ -110,13 +136,65 @@ class MarstekService:
                        "write": {"requestedPower": None, "acknowledged": False, "verified": False, "verifiedPower": None,
                                  "verificationTimestamp": None, "verificationError": None}}
         self._last_success_monotonic: float | None = None
+        self._last_communication_monotonic: float | None = None
         self._last_battery_poll = 0.0
+        self._last_poll_loop_monotonic: float | None = None
         self._device_loaded = False
+        # Exactly one persistence owner; never hold the UDP/poll locks for enrichment.
+        self._history_queue = queue.Queue(maxsize=128)
+        self._history_status_lock = threading.Lock()
+        self._history_status = {"pending": 0, "rejected": 0, "errors": 0,
+                                "lastError": None, "lastCompletedAt": None}
+        self._history_thread = None
+        if self.history is not None:
+            self._history_thread = threading.Thread(target=self._history_loop,
+                name="marstek-history-writer", daemon=True)
+            self._history_thread.start()
         self._diagnostic_lock = threading.Lock()
         self._previous_write_power: int | None = None
         self._previous_write_monotonic: float | None = None
+        if hasattr(self.client, "set_communication_observer"):
+            self.client.set_communication_observer(self._on_communication_success)
         if start_polling:
             self._thread = threading.Thread(target=self._poll_loop, name="marstek-poller", daemon=True); self._thread.start()
+
+    def _history_loop(self):
+        while not self._stop.is_set() or not self._history_queue.empty():
+            try:
+                state, stamp = self._history_queue.get(timeout=.1)
+            except queue.Empty:
+                continue
+            try:
+                recorded = self.history.record(state, stamp)
+                error = getattr(self.history, "last_error", None)
+                if recorded is False and error:
+                    raise RuntimeError(error)
+                with self._history_status_lock:
+                    self._history_status.update(lastError=None, lastCompletedAt=utc_now())
+            except Exception as exc:
+                with self._history_status_lock:
+                    self._history_status["errors"] += 1
+                    self._history_status["lastError"] = f"{type(exc).__name__}: {exc}"
+                logger.exception("Marstek history/provider failure; device polling isolated")
+            finally:
+                self._history_queue.task_done()
+                with self._history_status_lock:
+                    self._history_status["pending"] -= 1
+
+    def _enqueue_history(self, state, stamp):
+        with self._history_status_lock:
+            try:
+                self._history_queue.put_nowait((state, stamp))
+                self._history_status["pending"] += 1
+            except queue.Full:
+                self._history_status["rejected"] += 1
+                self._history_status["lastError"] = "History queue full; sample not persisted"
+
+    def close_history(self, timeout=5):
+        if self._history_thread is not None:
+            self._history_thread.join(timeout)
+            if self._history_thread.is_alive():
+                raise TimeoutError("Marstek history writer has not drained")
 
     def _write_power_diagnostic(self, payload: dict[str, Any]):
         if not bool(self.config.get("powerControlDiagnostics", False)):
@@ -129,11 +207,10 @@ class MarstekService:
             if not configured_path:
                 return
             path = Path(configured_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            # Directory creation and all disk I/O belong to the log writer.
             line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
             with self._diagnostic_lock:
-                with path.open("a", encoding="utf-8") as handle:
-                    handle.write(line)
+                append_daily_log(path, line)
         except Exception:
             # Diagnostics must never affect device control or polling.
             pass
@@ -141,10 +218,37 @@ class MarstekService:
     def _set(self, **values):
         with self._state_lock: self._state.update(values)
 
+    def _on_communication_success(self, method: str):
+        now = utc_now()
+        self._last_communication_monotonic = time.monotonic()
+        values = {
+            "online": True,
+            "communicationStale": False,
+            "lastCommunicationAt": now,
+            "lastError": None,
+            "consecutiveFailures": 0,
+        }
+        if method == "ES.SetMode":
+            values["lastSuccessfulWriteAt"] = now
+        else:
+            values["lastSuccessfulReadAt"] = now
+        self._set(**values)
+
     def snapshot(self):
         with self._state_lock:
             result = copy.deepcopy(self._state)
-        result["stale"] = self._last_success_monotonic is None or time.monotonic() - self._last_success_monotonic > float(self.config["staleThresholdSeconds"])
+        now = time.monotonic()
+        threshold = float(self.config["staleThresholdSeconds"])
+        result["stale"] = self._last_success_monotonic is None or now - self._last_success_monotonic > threshold
+        result["communicationStale"] = self._last_communication_monotonic is None or now - self._last_communication_monotonic > threshold
+        thread = getattr(self, "_thread", None)
+        result["pollerAlive"] = thread is None or thread.is_alive()
+        result["pollLoopStale"] = bool(thread is not None and self._last_poll_loop_monotonic is not None
+                                         and now - self._last_poll_loop_monotonic > max(90.0, float(self.config["statusPollIntervalSeconds"]) * 4))
+        result["telemetryFresh"] = not result["stale"]
+        result["communicationHealthy"] = bool(result["online"] and not result["communicationStale"])
+        with self._history_status_lock:
+            result["historyWriter"] = dict(self._history_status)
         return result
 
     def poll_once(self) -> bool:
@@ -174,7 +278,7 @@ class MarstekService:
                 values.update(model=device.get("model", device.get("device")), deviceApiVersion=device.get("ver", device.get("version", device.get("api_version"))))
             self._last_success_monotonic = time.monotonic(); self._set(**values)
             if self.history is not None:
-                self.history.record(self.snapshot(), values["lastSuccessfulPoll"])
+                self._enqueue_history(self.snapshot(), values["lastSuccessfulPoll"])
             return True
         except VenusError as exc:
             with self._state_lock:
@@ -184,14 +288,39 @@ class MarstekService:
         finally: self._poll_lock.release()
 
     def _poll_loop(self):
-        while not self._stop.wait(float(self.config["statusPollIntervalSeconds"])): self.poll_once()
+        while not self._stop.wait(float(self.config["statusPollIntervalSeconds"])):
+            self._last_poll_loop_monotonic = time.monotonic()
+            try:
+                self.poll_once()
+            except Exception as exc:
+                logger.exception("Unexpected Marstek polling failure; retrying next cycle")
+                with self._state_lock:
+                    failures = self._state["consecutiveFailures"] + 1
+                    self._state.update(lastError=f"{type(exc).__name__}: {exc}",
+                                       consecutiveFailures=failures,
+                                       online=failures < int(self.config["unhealthyFailureThreshold"]))
 
     def health(self):
         s = self.snapshot()
-        if not s["online"]: level, code = "unhealthy", 503
-        elif s["stale"] or s["consecutiveFailures"] or (s["write"]["acknowledged"] and not s["write"]["verified"]): level, code = "degraded", 200
-        else: level, code = "healthy", 200
-        result = {"ok": level == "healthy", "status": level, "online": s["online"], "stale": s["stale"], "consecutiveFailures": s["consecutiveFailures"], "lastError": s["lastError"]}
+        # Health is passive: it never sends UDP. Any successful request/response,
+        # including a SetMode ACK, proves communication liveness. Telemetry
+        # freshness remains separate because writes do not refresh all sensor data.
+        if not s["online"] or s["communicationStale"] or not s["pollerAlive"] or s["pollLoopStale"]:
+            level, code = "unhealthy", 503
+        elif s["stale"] or s["consecutiveFailures"] or (s["write"]["acknowledged"] and not s["write"]["verified"]):
+            level, code = "degraded", 200
+        else:
+            level, code = "healthy", 200
+        result = {
+            "ok": level == "healthy", "status": level, "online": s["online"],
+            "stale": s["stale"], "telemetryFresh": s["telemetryFresh"],
+            "communicationHealthy": s["communicationHealthy"], "communicationStale": s["communicationStale"],
+            "lastCommunicationAt": s["lastCommunicationAt"],
+            "lastSuccessfulReadAt": s["lastSuccessfulReadAt"],
+            "lastSuccessfulWriteAt": s["lastSuccessfulWriteAt"],
+            "pollerAlive": s["pollerAlive"], "pollLoopStale": s["pollLoopStale"],
+            "consecutiveFailures": s["consecutiveFailures"], "lastError": s["lastError"]
+        }
         if self.history is not None:
             result["persistence"] = self.history.health()
             if not result["persistence"]["databaseReachable"] or result["persistence"]["persistenceError"]:
@@ -225,11 +354,17 @@ class MarstekService:
             maximum_duration = int(self.config.get("maximumCommandCdTimeSeconds", 960))
             if power and duration > maximum_duration:
                 raise VenusError(f"Non-zero cd_time exceeds configured maximum of {maximum_duration} seconds")
-            write = {"requestedPower": power, "acknowledged": False, "verified": False, "verifiedPower": None, "verificationTimestamp": None, "verificationError": None}
+            metadata = diagnostic_metadata if isinstance(diagnostic_metadata, dict) else {}
+            write = {"requestedPower": power, "acknowledged": False, "verified": False, "verifiedPower": None,
+                     "verificationTimestamp": None, "verificationError": None,
+                     "plannerAction": metadata.get("plannerAction"),
+                     "plannerReason": metadata.get("plannerReason"),
+                     "solarSurplusWatts": metadata.get("solarSurplusWatts"),
+                     "siteNetWithoutBatteryWatts": metadata.get("siteNetWithoutBatteryWatts"),
+                     "plannerRecommendedPowerWatts": metadata.get("plannerRecommendedPowerWatts")}
             command_id = str(uuid.uuid4())
             write_started = time.monotonic()
             seconds_since_previous = None if self._previous_write_monotonic is None else write_started - self._previous_write_monotonic
-            metadata = diagnostic_metadata if isinstance(diagnostic_metadata, dict) else {}
             common = {"commandId": command_id, "requestedPowerWatts": power,
                       "plannerReason": metadata.get("plannerReason"),
                       "siteNetWithoutBatteryWatts": metadata.get("siteNetWithoutBatteryWatts"),
